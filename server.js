@@ -157,8 +157,8 @@ passport.use(new Steam(
   async (_identifier, profile, done) => {
     try {
       const user = await getPlayerSummary(profile.id);
-      // ── Mantém perfil fresco no SQLite ──
-      db.updateProfile({
+      // Mantem perfil fresco no MySQL.
+      await db.updateProfile({
         steamId    : user.steamId,
         personaName: user.personaName,
         avatarUrl  : user.avatarUrl,
@@ -499,7 +499,7 @@ app.listen(PORT, () => {
 
 
 // =============================================================================
-//  server-leaderboard-patch.js  (v2 — SQLite)
+//  server-leaderboard-patch.js  (v3 - MySQL)
 //
 //  Substitui a versão anterior (que usava Map em memória).
 //
@@ -507,25 +507,25 @@ app.listen(PORT, () => {
 //    if (process.env.NODE_ENV === 'production') { ... }
 //
 //  Requer:
-//    npm install better-sqlite3
-//    const db = require('./db/db');   ← adicione no topo do server.js
+//    npm install mysql2
+//    const db = require('./db');   <- adicione no topo do server.js
 //
 //  Endpoints:
 //    POST   /api/leaderboard/register     → upserta stats do usuário logado
 //    GET    /api/leaderboard/global       → top N jogadores (paginado)
-//    GET    /api/leaderboard/friends      → amigos do Steam (combinado Steam + SQLite)
-//    GET    /api/leaderboard/search?q=    → busca por nome no SQLite
+//    GET    /api/leaderboard/friends      → amigos do Steam (combinado Steam + MySQL)
+//    GET    /api/leaderboard/search?q=    → busca por nome no MySQL
 //    GET    /api/leaderboard/me/rank      → posição global do usuário logado
 // =============================================================================
 
 'use strict';
 
 // ─── Adicione esta linha no TOPO do server.js, junto com os outros requires ──
-// const db = require('./db/db');
+// const db = require('./db');
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── Cache leve para o endpoint de amigos (evita hammerar Steam API) ─────────
-// O global usa SQLite diretamente — sem cache extra necessário.
+// O global usa MySQL diretamente, sem cache extra necessario.
 const _friendsCache = new Map();
 
 function getFriendsCache(steamId)        { return _friendsCache.get(steamId) ?? null; }
@@ -537,12 +537,12 @@ function isFriendsCacheFresh(steamId)    {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  POST /api/leaderboard/register
-//  Registra (ou atualiza) os stats do usuário logado no SQLite.
+//  Registra (ou atualiza) os stats do usuario logado no MySQL.
 //  Deve ser chamado pelo frontend toda vez que os jogos terminam de carregar.
 //
 //  Body: { totalAch, platCount, rareCount, gameCount }
 // ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/leaderboard/register', requireAuth, (req, res) => {
+app.post('/api/leaderboard/register', requireAuth, async (req, res) => {
   const { totalAch, platCount, rareCount, gameCount } = req.body;
 
   if (
@@ -556,7 +556,7 @@ app.post('/api/leaderboard/register', requireAuth, (req, res) => {
   const user = req.user;
 
   try {
-    db.upsertPlayer({
+    await db.upsertPlayer({
       steamId    : user.steamId,
       personaName: user.personaName,
       avatarUrl  : user.avatarUrl,
@@ -621,7 +621,7 @@ app.post('/api/leaderboard/register/:steamId', requireAuth, async (req, res) => 
       };
     }
 
-    db.upsertPlayer({
+    await db.upsertPlayer({
       ...playerData,
       totalAch,
       platCount,
@@ -672,10 +672,10 @@ app.get('/api/player/:steamId/friends', requireAuth, async (req, res) => {
     });
     const players = summaryData?.response?.players ?? [];
 
-    // 3. Busca stats dos amigos que estão no SQLite (leaderboard)
-    const friendIdsInDb = db.getPlayersByIds ? db.getPlayersByIds(friendIds) : [];
+    // 3. Busca stats dos amigos que estao no MySQL (leaderboard)
+    const friendIdsInDb = db.getPlayersByIds ? await db.getPlayersByIds(friendIds) : [];
 
-    // 4. Monta resultado combinando Steam + SQLite
+    // 4. Monta resultado combinando Steam + MySQL
     const result = players.map((p) => {
       const dbData = friendIdsInDb.find((x) => x.steamId === p.steamid);
       return {
@@ -684,7 +684,7 @@ app.get('/api/player/:steamId/friends', requireAuth, async (req, res) => {
         avatarUrl: p.avatarfull,
         profileUrl: p.profileurl,
         isPrivate: p.communityvisibilitystate < 3,
-        // Stats do SQLite (se estiver registrado)
+        // Stats do MySQL (se estiver registrado)
         totalAch: dbData?.totalAch ?? null,
         platCount: dbData?.platCount ?? null,
         gameCount: dbData?.gameCount ?? null,
@@ -700,16 +700,16 @@ app.get('/api/player/:steamId/friends', requireAuth, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  GET /api/leaderboard/global?page=1&limit=50
-//  Retorna o ranking global de todos os usuários registrados no SQLite.
+//  Retorna o ranking global de todos os usuarios registrados no MySQL.
 //  Paginado. Inclui flag isMe para o usuário logado.
 // ─────────────────────────────────────────────────────────────────────────────
-app.get('/api/leaderboard/global', requireAuth, (req, res) => {
+app.get('/api/leaderboard/global', requireAuth, async (req, res) => {
   const page  = Math.max(1, parseInt(req.query.page  ?? '1',  10));
   const limit = Math.min(100, Math.max(10, parseInt(req.query.limit ?? '50', 10)));
   const mySteamId = req.user.steamId;
 
   try {
-    const result = db.getGlobalLeaderboard(page, limit);
+    const result = await db.getGlobalLeaderboard(page, limit);
 
     // Injeta flag isMe e garante rank correto
     result.entries = result.entries.map((e, i) => ({
@@ -731,8 +731,8 @@ app.get('/api/leaderboard/global', requireAuth, (req, res) => {
 //
 //  Estratégia:
 //    1. Busca lista de amigos no Steam (pode falhar se perfil privado)
-//    2. Para amigos que estão no SQLite → usa dados do SQLite (ach real)
-//    3. Para amigos que NÃO estão no SQLite → busca gameCount no Steam API
+//    2. Para amigos que estao no MySQL -> usa dados do MySQL (ach real)
+//    3. Para amigos que NAO estao no MySQL -> busca gameCount no Steam API
 //    4. Ordena: registrados por totalAch desc, não-registrados por gameCount desc
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/leaderboard/friends', requireAuth, async (req, res) => {
@@ -763,11 +763,11 @@ app.get('/api/leaderboard/friends', requireAuth, async (req, res) => {
     });
     const steamPlayers = summaryData?.response?.players ?? [];
 
-    // 3. Quem já está no SQLite?
-    const dbEntries  = db.getPlayersByIds(allIds);
+    // 3. Quem ja esta no MySQL?
+    const dbEntries  = await db.getPlayersByIds(allIds);
     const dbMap      = new Map(dbEntries.map(e => [e.steamId, e]));
 
-    // 4. Para os que não estão no SQLite, busca gameCount em paralelo (pool de 6)
+    // 4. Para os que nao estao no MySQL, busca gameCount em paralelo (pool de 6)
     const notInDb    = steamPlayers.filter(p => !dbMap.has(p.steamid));
     const gameCountMap = new Map();
 
@@ -839,16 +839,16 @@ app.get('/api/leaderboard/friends', requireAuth, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  GET /api/leaderboard/search?q=nome
-//  Busca jogadores pelo nome dentro do SQLite.
+//  Busca jogadores pelo nome dentro do MySQL.
 // ─────────────────────────────────────────────────────────────────────────────
-app.get('/api/leaderboard/search', requireAuth, (req, res) => {
+app.get('/api/leaderboard/search', requireAuth, async (req, res) => {
   const q = (req.query.q ?? '').trim();
   if (!q || q.length < 2) return res.json([]);
 
   const mySteamId = req.user.steamId;
 
   try {
-    const results = db.searchPlayers(q).map((e, i) => ({
+    const results = (await db.searchPlayers(q)).map((e, i) => ({
       ...e,
       rank: i + 1,
       isMe: e.steamId === mySteamId,
@@ -863,9 +863,9 @@ app.get('/api/leaderboard/search', requireAuth, (req, res) => {
 //  GET /api/leaderboard/me/rank
 //  Retorna a posição global do usuário logado.
 // ─────────────────────────────────────────────────────────────────────────────
-app.get('/api/leaderboard/me/rank', requireAuth, (req, res) => {
+app.get('/api/leaderboard/me/rank', requireAuth, async (req, res) => {
   try {
-    const rank = db.getGlobalRank(req.user.steamId);
+    const rank = await db.getGlobalRank(req.user.steamId);
     return res.json({ rank });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -873,13 +873,13 @@ app.get('/api/leaderboard/me/rank', requireAuth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Atualiza o perfil do usuário no SQLite a cada login
+//  Atualiza o perfil do usuario no MySQL a cada login
 //  (coloque dentro do callback do passport.use, depois de done(null, user))
 //
 //  Adicione no bloco passport.use de Steam, dentro do try, DEPOIS do done:
 //
 //    const user = await getPlayerSummary(profile.id);
-//    // ── Mantém perfil fresco no SQLite ──
+//    // Mantem perfil fresco no MySQL.
 //    db.updateProfile({
 //      steamId    : user.steamId,
 //      personaName: user.personaName,
