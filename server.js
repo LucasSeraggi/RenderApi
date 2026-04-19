@@ -23,6 +23,7 @@ const session   = require('express-session');
 const passport  = require('passport');
 const Steam     = require('passport-steam').Strategy;
 const path      = require('path');
+const fs        = require('fs');
 const compression = require('compression');
 const db        = require('./db');
 
@@ -32,6 +33,18 @@ const SECRET      = process.env.SESSION_SECRET || 'change-me-in-production';
 const PORT        = parseInt(process.env.PORT || '3000', 10);
 const BASE_URL    = process.env.BASE_URL || `http://localhost:${PORT}`;
 const NODE_ENV    = process.env.NODE_ENV || 'development';
+const FRONTEND_URL = process.env.FRONTEND_URL || (NODE_ENV === 'production'
+  ? BASE_URL
+  : 'http://localhost:5173');
+const ALLOWED_ORIGINS = new Set(
+  [
+    FRONTEND_URL,
+    'http://localhost:5173',
+    ...(process.env.CORS_ORIGINS || '').split(','),
+  ]
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+);
 const isDev       = NODE_ENV === 'development';
 
 if (!API_KEY) {
@@ -174,6 +187,25 @@ passport.use(new Steam(
 
 // ─── App ─────────────────────────────────────────────────────────────────────
 const app = express();
+app.set('trust proxy', 1);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.set('Access-Control-Allow-Origin', origin);
+    res.set('Access-Control-Allow-Credentials', 'true');
+    res.set('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.set('Vary', 'Origin');
+  }
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  return next();
+});
 
 // ─── Middlewares ─────────────────────────────────────────────────────────────
 // Compressão gzip para reduzir tamanho das respostas
@@ -236,17 +268,14 @@ function dedupeRequests(keyGenerator) {
 
 // ─── Auth routes ──────────────────────────────────────────────────────────────
 app.get('/auth/steam',
-  passport.authenticate('steam', { failureRedirect: '/' })
+  passport.authenticate('steam', { failureRedirect: `${FRONTEND_URL}/?error=auth` })
 );
 
 app.get('/auth/steam/return',
-  passport.authenticate('steam', { failureRedirect: '/?error=auth' }),
+  passport.authenticate('steam', { failureRedirect: `${FRONTEND_URL}/?error=auth` }),
   (req, res) => {
     // Em dev, o frontend está em :5173; em prod, servimos o build do React
-    const frontendUrl = process.env.NODE_ENV === 'production'
-      ? `${BASE_URL}/?loggedIn=1`
-      : `http://localhost:5173/?loggedIn=1`;
-    res.redirect(frontendUrl);
+    res.redirect(`${FRONTEND_URL}/?loggedIn=1`);
   }
 );
 
@@ -480,11 +509,16 @@ app.get('/api/player/:steamId/games/:appId/achievements', requireAuth, async (re
 });
 
 // ─── Servir build do React em produção ───────────────────────────────────────
-if (process.env.NODE_ENV === 'production') {
-  const distPath = path.join(__dirname, 'dist');
-  app.use(express.static(distPath));
-  app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
-}
+app.get('/', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'Steam Trophy Tracker API',
+  });
+});
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true });
+});
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
@@ -888,4 +922,21 @@ app.get('/api/leaderboard/me/rank', requireAuth, async (req, res) => {
 //      isPrivate  : user.communityVisibilityState < 3,
 //    });
 //    done(null, user);
+
+function registerProductionFrontend() {
+  if (NODE_ENV !== 'production') return;
+
+  const distPath = path.join(__dirname, 'dist');
+  const indexPath = path.join(distPath, 'index.html');
+
+  if (!fs.existsSync(indexPath)) {
+    console.warn('[Static] dist/index.html nao encontrado; rodando apenas API.');
+    return;
+  }
+
+  app.use(express.static(distPath));
+  app.get('*', (_req, res) => res.sendFile(indexPath));
+}
+
+registerProductionFrontend();
 // ─────────────────────────────────────────────────────────────────────────────
